@@ -109,6 +109,12 @@ class TapVendit(Tap):
             default=3,
             description="Maximum number of retries for failed requests.",
         ),
+        th.Property(
+            "history_purchase_orders_lookback_days",
+            th.IntegerType(),
+            default=7,
+            description="Days to re-read before the history_purchase_orders deliveryDatetime bookmark, to catch late-saved deliveries.",
+        ),
         th.Property("state_file", th.StringType, required=False),
         th.Property("sync_endpoints", th.BooleanType, required=False),
     ).to_dict()
