@@ -876,6 +876,15 @@ class PurchaseOrdersOptiplyStream(BaseOptiplyStream):
 
     def get_url(self, unix_ms: int) -> str:
         return f"{self.config['api_url']}{self.path}/{unix_ms}"
+
+    def get_starting_replication_key_value(self, context: dict | None):
+        """Always read the full open-order list.
+
+        The endpoint only returns orders that are still open and were created after
+        the given date; it has no change or deletion records. Reading from the
+        epoch every run is the only way to see lines and orders closed in Vendit.
+        """
+        return None
     
     def get_records(self, context: dict | None) -> Iterable[dict]:
         """Override get_records to add data cleaning and details field extraction."""
