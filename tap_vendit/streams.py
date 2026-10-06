@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import typing as t
 from importlib import resources
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Iterable, TYPE_CHECKING
 import time
 import os
@@ -49,7 +49,8 @@ FILTER_COMPARISONS = {
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_BATCH_SIZE = 100
 DEFAULT_CONNECTION_POOL_SIZE = 10
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
+DEFAULT_HISTORY_PURCHASE_ORDERS_LOOKBACK_DAYS = 7
 
 class BaseStream(VenditStream):
     """Base stream with DRY incremental and request logic."""
@@ -93,7 +94,7 @@ class BaseStream(VenditStream):
     @backoff.on_exception(
         backoff.expo,
         (requests.exceptions.RequestException, requests.exceptions.HTTPError),
-        max_tries=3,
+        max_tries=DEFAULT_MAX_RETRIES,
         factor=2,
         jitter=backoff.random_jitter
     )
@@ -117,6 +118,12 @@ class BaseStream(VenditStream):
             headers = self.authenticator.auth_headers
             kwargs['headers'] = headers
             response = self.session.request(method, url, **kwargs)
+        
+        # Rate limits and server errors are transient: raise so backoff retries,
+        # and fail the sync once retries are exhausted instead of skipping records.
+        if response.status_code == 429 or response.status_code >= 500:
+            self.logger.warning(f"⚠️ HTTP {response.status_code} on {method} {url}, retrying...")
+            response.raise_for_status()
         
         return response
 
@@ -216,11 +223,7 @@ class BaseOptiplyStream(BaseStream):
         url = self.get_url(last_synced_unix)
         self.logger.info(f"Fetching data from {url}")
         
-        response = self.session.get(url, headers=self.authenticator.auth_headers)
-        if response.status_code != 200:
-            self.logger.error(f"Error fetching data: {response.status_code}")
-            self.logger.error(response.text)
-            return
+        response = self._request("GET", url)
         
         data = self._parse_json_response(response, f"fetching {self.name}")
         items = data.get("items", [])
@@ -271,7 +274,6 @@ class BaseFindGetMultipleStream(BaseFindStream):
         self.logger.info(f"📊 Processing {len(all_ids)} records in {total_batches} batches (batch size: {DEFAULT_BATCH_SIZE})")
         
         successful_batches = 0
-        failed_batches = 0
         total_items = 0
         
         for batch_num, i in enumerate(range(0, len(all_ids), DEFAULT_BATCH_SIZE), 1):
@@ -282,12 +284,6 @@ class BaseFindGetMultipleStream(BaseFindStream):
             
             url = f"{self.config['api_url']}{self.path}"
             response = self._request("POST", url, json={"primaryKeys": batch})
-            
-            if response.status_code != 200:
-                self.logger.error(f"❌ Failed to fetch {self.name} batch {batch_num}: HTTP {response.status_code}")
-                failed_batches += 1
-                continue
-                
             data = self._parse_json_response(response, f"fetching {self.name} batch {batch_num}")
             items = data.get("items", [])
             total_items += len(items)
@@ -303,7 +299,6 @@ class BaseFindGetMultipleStream(BaseFindStream):
         self.logger.info(f"📊 Final Summary:")
         self.logger.info(f"   • Total IDs found: {len(all_ids)}")
         self.logger.info(f"   • Successful batches: {successful_batches}/{total_batches}")
-        self.logger.info(f"   • Failed batches: {failed_batches}")
         self.logger.info(f"   • Total items retrieved: {total_items}")
         self.logger.info(f"   • Total time: {total_elapsed:.2f}s")
         self.logger.info(f"   • Average time per batch: {total_elapsed/total_batches:.3f}s")
@@ -347,12 +342,6 @@ class BaseFindGetWithDetailsStream(BaseFindStream):
             
             url = f"{self.config['api_url']}{self.path}/{item_id}"
             response = self._request("GET", url)
-            
-            if response.status_code != 200:
-                self.logger.error(f"❌ Failed to fetch {self.name} {item_id}: HTTP {response.status_code}")
-                failed += 1
-                continue
-                
             data = self._parse_json_response(response, f"fetching {self.name} {item_id}")
             if data:
                 successful += 1
@@ -486,11 +475,6 @@ class ProductsStream(BaseFindGetMultipleStream):
             batch = all_ids[i:i + DEFAULT_BATCH_SIZE]
             url = f"{self.config['api_url']}{self.path}"
             response = self._request("POST", url, json={"primaryKeys": batch})
-            
-            if response.status_code != 200:
-                self.logger.error(f"Error fetching {self.name} batch: {response.status_code}")
-                continue
-                
             data = self._parse_json_response(response, f"fetching {self.name} batch")
             for item in data.get("items", []):
                 yield item
@@ -580,11 +564,6 @@ class SuppliersStream(BaseFindGetMultipleStream):
             batch = supplier_ids[i:i + DEFAULT_BATCH_SIZE]
             url = f"{self.config['api_url']}{self.path}"
             response = self._request("POST", url, json={"primaryKeys": batch})
-            
-            if response.status_code != 200:
-                self.logger.error(f"Error fetching suppliers batch: {response.status_code}")
-                continue
-                
             data = self._parse_json_response(response, "fetching suppliers batch")
             for item in data.get("items", []):
                 yield item
@@ -697,11 +676,6 @@ class OrdersStream(BaseFindGetWithDetailsStream):
         for item_id in all_ids:
             url = f"{self.config['api_url']}{self.path}/{item_id}"
             response = self._request("GET", url)
-            
-            if response.status_code != 200:
-                self.logger.error(f"Error fetching {self.name} {item_id}: {response.status_code}")
-                continue
-                
             data = self._parse_json_response(response, f"fetching {self.name} {item_id}")
             if data:
                 yield data
@@ -712,7 +686,30 @@ class PurchaseOrdersStream(BaseFindGetWithDetailsStream):
     primary_keys = ["productPurchaseOrderId"]
     replication_key = None
     records_jsonpath = "$"
-    # No schema - dynamic field discovery
+
+    @property
+    def schema(self):
+        """Return schema specific to purchase orders data (ProductPurchaseOrder)."""
+        return {
+            "type": "object",
+            "properties": {
+                "productPurchaseOrderId": {"type": ["integer", "null"]},
+                "officeId": {"type": ["integer", "null"]},
+                "purchaseOrderNumber": {"type": ["string", "null"]},
+                "supplierId": {"type": ["integer", "null"]},
+                "orderDatetime": {"type": ["string", "null"], "format": "date-time"},
+                "orderExpectedDeliveryDate": {"type": ["string", "null"], "format": "date-time"},
+                "orderExpectedDeliveryWeek": {"type": ["integer", "null"]},
+                "orderReference": {"type": ["string", "null"]},
+                "preorderEmployeeId": {"type": ["integer", "null"]},
+                "employeeId": {"type": ["integer", "null"]},
+                "onlineOrderReference": {"type": ["string", "null"]},
+                "orderRemark": {"type": ["string", "null"]},
+                "optiplyId": {"type": ["string", "null"]},
+                "details": {"type": ["array", "null"]}
+            },
+            "additionalProperties": True
+        }
 
     @property
     def path(self):
@@ -765,13 +762,20 @@ class PurchaseOrdersStream(BaseFindGetWithDetailsStream):
         for po_id in all_ids:
             url = f"{self.config['api_url']}{self.path}/{po_id}"
             response = self._request("GET", url)
-            
-            if response.status_code != 200:
-                self.logger.error(f"Error fetching purchase order {po_id}: {response.status_code}")
-                continue
-                
             data = self._parse_json_response(response, f"fetching purchase order {po_id}")
             if data:
+                # Clean empty strings that should be nulls
+                for key, value in data.items():
+                    if value == "":
+                        data[key] = None
+                    # Handle literal "string" values that should be null
+                    elif key == "optiplyId" and value == "string":
+                        data[key] = None
+                
+                # Fix details field - extract items from the object
+                if "details" in data and isinstance(data["details"], dict) and "items" in data["details"]:
+                    data["details"] = data["details"]["items"]
+                
                 yield data
 
 class SupplierProductsStream(BaseOptiplyStream):
@@ -1065,16 +1069,8 @@ class PrePurchaseOrdersStream(BaseStream):
         self.logger.info("⏳ Making API request...")
         
         response = self._request("GET", url)
-        
-        if response.status_code != 200:
-            self.logger.error(f"❌ Error fetching pre purchase orders: {response.status_code}")
-            self.logger.error(f"Response: {response.text}")
-            return
-        
-        self.logger.info("✅ API request successful")
-        
-        # Parse the response manually since the parent parse_response might not work
         data = self._parse_json_response(response, "fetching pre purchase orders")
+        self.logger.info("✅ API request successful")
         items = data.get("items", [])
         
         self.logger.info(f"📊 Retrieved {len(items)} pre purchase orders")
@@ -1207,12 +1203,6 @@ class HistoryPurchaseOrdersStream(BaseFindGetWithDetailsStream):
             
             url = f"{self.config['api_url']}{self.path}/{po_id}"
             response = self._request("GET", url)
-            
-            if response.status_code != 200:
-                self.logger.error(f"❌ Failed to fetch PO {po_id}: HTTP {response.status_code}")
-                failed += 1
-                continue
-                
             data = self._parse_json_response(response, f"fetching history purchase order {po_id}")
             if data:
                 # Clean empty strings that should be nulls
@@ -1242,7 +1232,22 @@ class HistoryPurchaseOrdersStream(BaseFindGetWithDetailsStream):
         if all_ids:
             self.logger.info(f"   • Average time per record: {total_elapsed/len(all_ids):.3f}s")
     
-    # Uses base class get_starting_time which handles deliveryDatetime replication key
+    def get_starting_time(self, context: Optional[dict]) -> datetime:
+        """Start a look-back window before the saved deliveryDatetime bookmark.
+        
+        Vendit can save a delivery after a later-timed delivery has already been
+        synced (back-dated or late-booked receipts). Without a look-back those
+        deliveries fall below the bookmark and are never fetched.
+        """
+        start_date = super().get_starting_time(context)
+        if self.get_context_state(context).get("replication_key_value"):
+            lookback_days = self.config.get(
+                "history_purchase_orders_lookback_days",
+                DEFAULT_HISTORY_PURCHASE_ORDERS_LOOKBACK_DAYS,
+            )
+            start_date -= timedelta(days=lookback_days)
+            self.logger.info(f"⏪ Applying {lookback_days}-day look-back to deliveryDatetime bookmark")
+        return start_date
 
 
 class SellOrderTransactionsStream(BaseFindGetWithDetailsStream):
@@ -1464,12 +1469,6 @@ class SellOrderTransactionsStream(BaseFindGetWithDetailsStream):
             
             url = f"{self.config['api_url']}{self.path}/{item_id}"
             response = self._request("GET", url)
-            
-            if response.status_code != 200:
-                self.logger.error(f"❌ Failed to fetch {self.name} {item_id}: HTTP {response.status_code}")
-                failed += 1
-                continue
-                
             data = self._parse_json_response(response, f"fetching {self.name} {item_id}")
             if data:
                 # Clean empty strings that should be nulls
@@ -1709,12 +1708,6 @@ class TransactionsStream(BaseFindGetWithDetailsStream):
             
             url = f"{self.config['api_url']}{self.path}/{item_id}"
             response = self._request("GET", url)
-            
-            if response.status_code != 200:
-                self.logger.error(f"❌ Failed to fetch {self.name} {item_id}: HTTP {response.status_code}")
-                failed += 1
-                continue
-                
             data = self._parse_json_response(response, f"fetching {self.name} {item_id}")
             if data:
                 # Clean empty strings that should be nulls

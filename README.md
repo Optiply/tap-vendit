@@ -10,7 +10,7 @@ Built with the [Meltano Tap SDK](https://sdk.meltano.com) for Singer Taps.
 - **Robust Authentication**: Token-based authentication with automatic refresh and persistence
 - **Incremental Sync**: Support for both timestamp-based and ID-based incremental synchronization
 - **Comprehensive Testing**: Built-in testing utilities for all streams with CSV and JSON output
-- **Error Handling**: Graceful handling of API errors with retry logic and exponential backoff
+- **Error Handling**: HTTP 429 and 5xx responses are retried with exponential backoff; any request that still fails stops the sync instead of skipping records, so the bookmark never moves past missing data
 - **SSL Security**: Configurable SSL certificate verification with proper warning suppression
 - **Connection Pooling**: Optimized HTTP connections for better performance
 - **Configuration Validation**: Comprehensive validation of configuration parameters
@@ -70,6 +70,7 @@ Then edit `config.json` with your actual credentials:
 - **`verify_ssl`**: Whether to verify SSL certificates (default: true)
 - **`connection_pool_size`**: Number of HTTP connections to pool (default: 10)
 - **`max_retries`**: Maximum number of retries for failed requests (default: 3)
+- **`history_purchase_orders_lookback_days`**: Days to re-read before the `history_purchase_orders` delivery bookmark, so deliveries saved late with an earlier delivery time are still picked up (default: 7)
 - **`state_file`**: Path to store sync state (optional)
 
 ## Authentication
